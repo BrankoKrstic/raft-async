@@ -18,6 +18,10 @@ pub struct Message {
 }
 pub enum Payload {
     GetState,
+    Topology {
+        node_id: PeerId,
+        peers: Vec<Peer>,
+    },
     AppendEntries {
         term: Term,
         leader_id: PeerId,
@@ -49,7 +53,7 @@ pub enum RecvMessage {}
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Copy)]
 struct Term(u64);
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 struct PeerId(u64);
 
 #[derive(Debug, Clone)]
@@ -67,7 +71,7 @@ enum NodeState {
     Follower,
 }
 
-pub struct Raft<T: Transport> {
+pub struct Raft<T> {
     id: PeerId,
     term: Term,
     state: NodeState,
@@ -92,14 +96,96 @@ impl<T: Transport> Raft<T> {
     fn get_state() {}
     fn request_vote() {}
     fn append_entries() {}
-    async fn run(&mut self) {
+    async fn recv_config(&mut self) {
+        loop {
+            let msg = self.transport.recv().await;
+            if let Message {
+                payload: Payload::Topology { node_id, peers },
+                ..
+            } = msg
+            {
+                self.id = node_id;
+                self.peers = peers;
+                break;
+            } else {
+                continue;
+            }
+        }
+    }
+    async fn run(mut self) {
+        self.recv_config().await;
         loop {
             match self.state {
-                NodeState::Leader => todo!(),
+                NodeState::Leader => {
+                    let timeout = Duration::from_millis(10);
+                    tokio::select! {
+                        _ = sleep(timeout) => {
+                            self.state = NodeState::Candidate
+                        }
+                        msg = self.transport.recv() => {
+                          match msg.payload {
+                              Payload::Topology { .. } => {},
+                              Payload::GetState => {
+                                self.transport.send(Message {
+                                  from: self.id,
+                                  to: self.id,
+                                  payload: Payload::State {
+                                    term: self.term,
+                                    state: self.state
+                                }}).await;
+                              }
+                              Payload::State { term, state } => {},
+                              Payload::RequestVote { term, last_log_index, last_log_term } => {
+                                if term >= self.term { // TODO: add log index checking here
+                                  if term > self.term {
+                                    self.term = term;
+                                    self.voted_for = None;
+                                  }
+                                  if self.voted_for.is_none() {
+                                    self.transport.send(Message {
+                                      from: self.id,
+                                      to: msg.from,
+                                      payload: Payload::RequestVoteReply {
+                                      term: self.term,
+                                      vote_granted: true
+                                    }}).await;
+                                    self.state = NodeState::Follower;
+                                    continue;
+                                  }
+                                } else {
+                                  self.transport.send(Message {
+                                    from: self.id,
+                                    to: msg.from,
+                                    payload: Payload::RequestVoteReply {
+                                    term: self.term,
+                                    vote_granted: false
+                                  }}).await;
+                                }
+                              },
+                              Payload::RequestVoteReply { term, vote_granted } => {},
+                              Payload::AppendEntries { term, leader_id, prev_log_index, prev_log_term, entries, leader_commit } => {
+                                if term <= self.term { // TODO: add log index checking here
+                                    self.transport.send(Message {
+                                      from: self.id,
+                                      to: msg.from,
+                                      payload: Payload::AppendEntriesResult { term: self.term, success: false }}).await;
+                                } else {
+                                  self.state = NodeState::Follower;
+                                  self.transport.send(Message {
+                                    from: self.id,
+                                    to: msg.from,
+                                    payload: Payload::AppendEntriesResult { term: self.term, success: true }}).await;
+                                }
+                              },
+                              Payload::AppendEntriesResult {..} => {},
+                          }
+                        }
+                    }
+                }
                 NodeState::Candidate => {
                     self.term.0 += 1;
                     self.voted_for = Some(self.id);
-                    let needs_votes = self.peers.len() + 1 / 2;
+                    let needs_votes = (self.peers.len() + 1) / 2;
                     for peer in &self.peers {
                         self.transport
                             .send(Message {
@@ -123,7 +209,16 @@ impl<T: Transport> Raft<T> {
                           _ = &mut timeout_fut => break,
                           msg = self.transport.recv() => {
                             match msg.payload {
-                              Payload::GetState => todo!(),
+                              Payload::Topology { .. } => {},
+                              Payload::GetState => {
+                                self.transport.send(Message {
+                                  from: self.id,
+                                  to: self.id,
+                                  payload: Payload::State {
+                                    term: self.term,
+                                    state: self.state
+                                }}).await;
+                              },
                               Payload::AppendEntries { term, leader_id, prev_log_index, prev_log_term, entries, leader_commit } => {
                                   if term >= self.term {
                                     self.term = term;
@@ -195,6 +290,7 @@ impl<T: Transport> Raft<T> {
                         }
                         msg = self.transport.recv() => {
                           match msg.payload {
+                              Payload::Topology { .. } => {},
                               Payload::GetState => {
                                 self.transport.send(Message {
                                   from: self.id,
@@ -252,5 +348,109 @@ impl<T: Transport> Raft<T> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub mod test {
+    use std::{collections::HashMap, time::Duration};
+
+    use tokio::sync::mpsc::{channel, Receiver, Sender};
+
+    use crate::{Message, NodeState, Payload, Peer, PeerId, PeerUrl, Raft, Transport};
+    struct LocalTransport {
+        tx: Sender<Message>,
+        rx: Receiver<Message>,
+    }
+
+    impl Transport for LocalTransport {
+        async fn send(&mut self, msg: Message) {
+            self.tx.send(msg).await.unwrap();
+        }
+
+        async fn recv(&mut self) -> Message {
+            self.rx.recv().await.unwrap()
+        }
+    }
+    struct RaftNode {
+        id: PeerId,
+        sender: Sender<Message>,
+    }
+
+    #[tokio::test]
+    async fn it_works() {
+        let (tx1, mut rx1) = channel(100);
+        let mut nodes = HashMap::new();
+        for i in 0..3 {
+            let (tx2, rx2) = channel(10);
+            let transport = LocalTransport {
+                tx: tx1.clone(),
+                rx: rx2,
+            };
+            let raft_node = RaftNode {
+                id: PeerId(i),
+                sender: tx2,
+            };
+            nodes.insert(i, raft_node);
+            tokio::spawn(Raft::new(transport).run());
+        }
+        for node in nodes.values() {
+            node.sender
+                .send(Message {
+                    from: PeerId(0),
+                    to: node.id,
+                    payload: crate::Payload::Topology {
+                        node_id: node.id,
+                        peers: nodes
+                            .values()
+                            .filter(|v| v.id != node.id)
+                            .map(|v| Peer {
+                                id: v.id,
+                                url: PeerUrl(String::new()),
+                            })
+                            .collect(),
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        let fut = tokio::time::sleep(Duration::from_millis(5000));
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+              _ = &mut fut => break,
+              msg = rx1.recv() => {
+                let msg = msg.unwrap();
+                let found_node = nodes.get(&msg.to.0).unwrap();
+                found_node.sender.send(msg).await.unwrap();
+              }
+            }
+        }
+        let mut num_leaders = 0;
+        let mut num_acks = 0;
+        for node in nodes.values() {
+            node.sender
+                .send(Message {
+                    from: PeerId(0),
+                    to: node.id,
+                    payload: crate::Payload::GetState,
+                })
+                .await
+                .unwrap();
+        }
+        while num_acks < 3 {
+            if let Message {
+                from,
+                payload: Payload::State { term, state },
+                to,
+            } = rx1.recv().await.unwrap()
+            {
+                if let NodeState::Leader = state {
+                    num_leaders += 1;
+                }
+                num_acks += 1;
+            }
+        }
+        assert_eq!(num_leaders, 1);
     }
 }
