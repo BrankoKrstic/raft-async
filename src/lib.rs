@@ -120,7 +120,13 @@ impl<T: Transport> Raft<T> {
                     let timeout = Duration::from_millis(10);
                     tokio::select! {
                         _ = sleep(timeout) => {
-                            self.state = NodeState::Candidate
+                          for node in &self.peers {
+                            self.transport.send(Message {
+                              from: self.id,
+                              to: node.id,
+                              payload: Payload::AppendEntries { term: self.term, leader_id: self.id, prev_log_index: 0, prev_log_term: 0, entries: vec![], leader_commit: 0 }
+                            }).await;
+                          }
                         }
                         msg = self.transport.recv() => {
                           match msg.payload {
@@ -136,12 +142,9 @@ impl<T: Transport> Raft<T> {
                               }
                               Payload::State { term, state } => {},
                               Payload::RequestVote { term, last_log_index, last_log_term } => {
-                                if term >= self.term { // TODO: add log index checking here
-                                  if term > self.term {
+                                if term > self.term { // TODO: add log index checking here
                                     self.term = term;
                                     self.voted_for = None;
-                                  }
-                                  if self.voted_for.is_none() {
                                     self.transport.send(Message {
                                       from: self.id,
                                       to: msg.from,
@@ -151,7 +154,6 @@ impl<T: Transport> Raft<T> {
                                     }}).await;
                                     self.state = NodeState::Follower;
                                     continue;
-                                  }
                                 } else {
                                   self.transport.send(Message {
                                     from: self.id,
@@ -183,6 +185,8 @@ impl<T: Transport> Raft<T> {
                     }
                 }
                 NodeState::Candidate => {
+                    eprintln!("Raft Instance {:?} initiating vote", self.id);
+
                     self.term.0 += 1;
                     self.voted_for = Some(self.id);
                     let needs_votes = (self.peers.len() + 1) / 2;
@@ -206,7 +210,10 @@ impl<T: Transport> Raft<T> {
                     let mut votes = 0;
                     loop {
                         tokio::select! {
-                          _ = &mut timeout_fut => break,
+                          _ = &mut timeout_fut => {
+                            eprintln!("Raft Instance {:?} vote timed out", self.id);
+                            break;
+                          },
                           msg = self.transport.recv() => {
                             match msg.payload {
                               Payload::Topology { .. } => {},
@@ -248,10 +255,12 @@ impl<T: Transport> Raft<T> {
                                       term: self.term,
                                       vote_granted: true
                                     }}).await;
+                                    eprintln!("Raft Instance {:?} voting for {:?}", self.id, msg.from);
 
                                     self.voted_for = Some(msg.from);
                                     break;
                                   } else {
+                                    eprintln!("Raft Instance {:?} refusing vote for {:?}", self.id, msg.from);
                                     self.transport.send(Message {
                                       from: self.id,
                                       to: msg.from,
@@ -266,6 +275,8 @@ impl<T: Transport> Raft<T> {
                                     votes += 1;
                                     if votes >= needs_votes {
                                       self.state = NodeState::Leader;
+                                      eprintln!("Raft Instance {:?} won vote", self.id);
+
                                       break;
                                     }
                                   } else if term > self.term {
@@ -315,9 +326,12 @@ impl<T: Transport> Raft<T> {
                                       term: self.term,
                                       vote_granted: true
                                     }}).await;
+                                    eprintln!("Raft Instance {:?} voting for {:?}", self.id, msg.from);
                                     continue;
                                   }
                                 } else {
+                                  eprintln!("Raft Instance {:?} refusing vote for {:?}", self.id, msg.from);
+
                                   self.transport.send(Message {
                                     from: self.id,
                                     to: msg.from,
