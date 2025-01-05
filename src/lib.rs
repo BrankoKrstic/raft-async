@@ -112,15 +112,20 @@ pub struct Raft<T, LogCommand> {
     transport: T,
     voted_for: Option<PeerId>,
     log: Vec<LogEntry<LogCommand>>,
-    event_receiver: Receiver<RaftCommand<LogCommand>>,
+    event_receiver: mpsc::Receiver<RaftCommand<LogCommand>>,
+    commit_channel: mpsc::Sender<LogCommand>,
 }
 
 pub enum AppendError {
     NotLeader,
 }
 
-impl<T: Transport<LogCommand>, LogCommand: Clone> Raft<T, LogCommand> {
-    fn new(transport: T, rx: mpsc::Receiver<RaftCommand<LogCommand>>) -> Self {
+impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
+    fn new(
+        transport: T,
+        rx: mpsc::Receiver<RaftCommand<LogCommand>>,
+        tx: mpsc::Sender<LogCommand>,
+    ) -> Self {
         Self {
             id: PeerId(0),
             term: Term(0),
@@ -132,6 +137,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone> Raft<T, LogCommand> {
             voted_for: None,
             log: vec![],
             event_receiver: rx,
+            commit_channel: tx,
         }
     }
     fn is_leader(&self) -> bool {
@@ -204,6 +210,20 @@ impl<T: Transport<LogCommand>, LogCommand: Clone> Raft<T, LogCommand> {
             RaftCommand::SubmitEntry { request, tx } => {
                 let result = self.submit_entry(request);
                 tx.send(result);
+            }
+        }
+    }
+    fn update_commit_index(&mut self, new_commit_index: usize) {
+        println!(
+            "Raft Instance {:?} updating commit index {}",
+            self.id, new_commit_index
+        );
+        if new_commit_index > self.commit_index {
+            let old_commit_index = self.commit_index;
+            self.commit_index = new_commit_index;
+            for item in &self.log[old_commit_index..new_commit_index] {
+                // TODO: possibly switch this to a blocking channel
+                let send_event = self.commit_channel.try_send(item.command.clone());
             }
         }
     }
@@ -288,14 +308,10 @@ impl<T: Transport<LogCommand>, LogCommand: Clone> Raft<T, LogCommand> {
                     self.log.push(log_entry);
                 }
             }
-            if req.leader_commit > self.commit_index {
-                self.commit_index = req.leader_commit.min(self.log.len());
-            }
         } else {
             self.log = req.entries;
-            self.commit_index = req.leader_commit.min(self.log.len());
         }
-        // TODO: Send newly committed items up the commit channel
+        self.update_commit_index(req.leader_commit.min(self.log.len()));
         AppendEntriesResponse {
             term: self.term,
             success: true,
@@ -316,12 +332,16 @@ impl<T: Transport<LogCommand>, LogCommand: Clone> Raft<T, LogCommand> {
                 return;
             } else {
                 let peer = self.peers.iter_mut().find(|p| p.id == peer_id);
+                // TODO: Actually have peers send their last log index here
                 if let Some(peer) = peer {
                     peer.log_index -= 1;
                 }
             }
         }
-        // TODO: Increment commit index if needed and send committed logs up the commit channel
+        let mut indices = self.peers.iter().map(|p| p.log_index).collect::<Vec<_>>();
+        indices.sort_unstable();
+        let new_commit_index = indices[(indices.len() - 1) / 2];
+        self.update_commit_index(new_commit_index);
     }
     pub async fn run(mut self) {
         loop {
@@ -542,9 +562,11 @@ pub mod test {
         let mut nodes = HashMap::new();
         let (tx2, mut rx2) = channel(100);
         let (tx3, mut rx3) = channel(100);
+        let mut comms_channels = vec![];
         for i in 0..3 {
-            let (tx1, mut rx1) = channel(100);
-
+            let (tx1, rx1) = channel(100);
+            let (tx4, rx4) = channel(100);
+            comms_channels.push(tx1.clone());
             let transport = LocalTransport {
                 ae_channel: tx2.clone(),
                 rv_channel: tx3.clone(),
@@ -554,7 +576,7 @@ pub mod test {
                 event_emitter: tx1,
             };
             nodes.insert(i, raft_node);
-            let mut raft = Raft::<_, String>::new(transport, rx1);
+            let mut raft = Raft::<_, String>::new(transport, rx1, tx4);
             raft.install_config(crate::Topology {
                 node_id: PeerId(i),
                 peers: (0..3).map(|i| Peer::new(PeerId(i))).collect(),
@@ -563,7 +585,20 @@ pub mod test {
         }
         let fut = tokio::time::sleep(Duration::from_millis(5000));
         tokio::pin!(fut);
-
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            for i in 0..40 {
+                for item in &mut comms_channels {
+                    let (tx, rx) = oneshot::channel();
+                    item.send(RaftCommand::SubmitEntry {
+                        request: format!("Iteration number {}", i),
+                        tx,
+                    })
+                    .await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
         loop {
             tokio::select! {
               _ = &mut fut => break,
