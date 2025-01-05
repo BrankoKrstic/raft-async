@@ -12,11 +12,13 @@ const ELECTION_TIMEOUT_MIN: u64 = 150;
 const ELECTION_TIMEOUT_MAX: u64 = 300;
 
 pub trait Transport<LogCommand> {
+    #[allow(async_fn_in_trait)]
     async fn append_entries(
         &self,
         peer_id: PeerId,
         msg: AppendEntriesRequest<LogCommand>,
     ) -> AppendEntriesResponse;
+    #[allow(async_fn_in_trait)]
     async fn request_votes(&self, peer_id: PeerId, msg: RequestVoteRequest) -> RequestVoteResponse;
 }
 
@@ -52,7 +54,7 @@ pub struct RequestVoteResponse {
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Copy)]
 struct Term(u64);
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
-struct PeerId(u64);
+pub struct PeerId(u64);
 
 enum VoteResult<LogCommand> {
     Winner,
@@ -66,9 +68,7 @@ enum VoteResult<LogCommand> {
 }
 
 #[derive(Debug, Clone)]
-struct PeerUrl(String);
-#[derive(Debug, Clone)]
-struct Peer {
+pub struct Peer {
     id: PeerId,
     log_index: Option<usize>,
 }
@@ -100,7 +100,7 @@ impl<LogCommand> LogEntry<LogCommand> {
     }
 }
 
-enum RaftCommand<LogCommand> {
+pub enum RaftCommand<LogCommand> {
     AppendEntries {
         request: AppendEntriesRequest<LogCommand>,
         tx: oneshot::Sender<AppendEntriesResponse>,
@@ -134,18 +134,25 @@ pub enum AppendError {
 }
 
 impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
-    fn new(
+    pub fn new(
         transport: T,
+        topology: Topology,
         rx: mpsc::Receiver<RaftCommand<LogCommand>>,
         tx: mpsc::Sender<LogCommand>,
     ) -> Self {
+        let id = topology.node_id;
+        let peers = topology
+            .peers
+            .into_iter()
+            .filter(|node| node.id != id)
+            .collect();
         Self {
-            id: PeerId(0),
+            id,
             term: Term(0),
             commit_index: None,
             last_applied: None,
             state: NodeState::Follower,
-            peers: vec![],
+            peers,
             transport,
             voted_for: None,
             log: vec![],
@@ -156,23 +163,13 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
     fn is_leader(&self) -> bool {
         matches!(self.state, NodeState::Leader)
     }
-    fn request_vote() {}
     fn submit_entry(&mut self, command: LogCommand) -> Result<(), AppendError> {
-        match self.state {
-            NodeState::Leader => {
-                self.log.push(LogEntry::new(self.term, command));
-                Ok(())
-            }
-            _ => Err(AppendError::NotLeader),
+        if self.is_leader() {
+            self.log.push(LogEntry::new(self.term, command));
+            Ok(())
+        } else {
+            Err(AppendError::NotLeader)
         }
-    }
-    fn install_config(&mut self, topology: Topology) {
-        self.id = topology.node_id;
-        self.peers = topology
-            .peers
-            .into_iter()
-            .filter(|node| node.id != self.id)
-            .collect();
     }
     fn handle_command(&mut self, command: RaftCommand<LogCommand>) {
         match command {
@@ -181,18 +178,18 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                 if response.success {
                     self.state = NodeState::Follower;
                 }
-                tx.send(response);
+                let _ = tx.send(response);
             }
             RaftCommand::RequestVote { request, tx } => {
                 let response = self.handle_request_vote(request);
                 if response.vote_granted {
                     self.state = NodeState::Follower;
                 }
-                tx.send(response);
+                let _ = tx.send(response);
             }
             RaftCommand::SubmitEntry { request, tx } => {
                 let result = self.submit_entry(request);
-                tx.send(result);
+                let _ = tx.send(result);
             }
         }
     }
@@ -208,7 +205,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                 [old_commit_index.unwrap_or_default()..new_commit_index.unwrap_or_default()]
             {
                 // TODO: possibly switch this to a blocking channel
-                let send_event = self.commit_channel.try_send(item.command.clone());
+                let _ = self.commit_channel.try_send(item.command.clone());
             }
         }
     }
@@ -292,7 +289,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
         } else {
             self.log = req.entries;
         }
-        if req.leader_commit.is_none() || self.log.len() == 0 {
+        if req.leader_commit.is_none() || self.log.is_empty() {
             self.update_commit_index(None);
         } else {
             self.update_commit_index(Some(req.leader_commit.unwrap().min(self.log.len() - 1)));
@@ -324,10 +321,9 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                 let peer = self.peers.iter_mut().find(|p| p.id == peer_id);
                 // TODO: Actually have peers send their last log index here
                 if let Some(peer) = peer {
-                    peer.log_index = peer
-                        .log_index
-                        .map(|v| if v == 0 { None } else { Some(v - 1) })
-                        .flatten();
+                    peer.log_index =
+                        peer.log_index
+                            .and_then(|v| if v == 0 { None } else { Some(v - 1) });
                 }
             }
         }
@@ -336,7 +332,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
         let new_commit_index = indices[(indices.len() - 1) / 2];
         self.update_commit_index(new_commit_index);
     }
-    pub async fn get_votes(&mut self) -> VoteResult<LogCommand> {
+    async fn get_votes(&mut self) -> VoteResult<LogCommand> {
         let cur_term = self.term;
         let needs_votes = (self.peers.len() + 1) / 2;
         let candidate_id = self.id;
@@ -393,19 +389,19 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                   },
                   command = self.event_receiver.recv() => {
                     match command.unwrap() {
-                        RaftCommand::SubmitEntry { request, tx } => {
-                            tx.send(Err(AppendError::NotLeader));
+                        RaftCommand::SubmitEntry { tx, .. } => {
+                            let _ = tx.send(Err(AppendError::NotLeader));
                         },
                         RaftCommand::AppendEntries { request, tx } => {
                             if request.term >= self.term {
                                 return VoteResult::OtherLeaderAppendRequest(request, tx);
                             } else {
-                                tx.send(AppendEntriesResponse { term: self.term, success: false });
+                                let _ = tx.send(AppendEntriesResponse { term: self.term, success: false });
                             }
                         },
                         RaftCommand::RequestVote { request, tx } => {
                             if request.term > self.term  {
-                                tx.send(RequestVoteResponse {
+                                let _ = tx.send(RequestVoteResponse {
                                     term: self.term,
                                     vote_granted: true
                                 });
@@ -416,7 +412,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                                 return VoteResult::BiggerTerm(request.term);
                             } else {
                                 eprintln!("Raft Instance {:?} refusing vote for {:?}", self.id, request.candidate_id);
-                                tx.send(RequestVoteResponse {
+                                let _ = tx.send(RequestVoteResponse {
                                     term: self.term,
                                     vote_granted: false
                                 });
@@ -460,7 +456,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                         VoteResult::Loser => self.state = NodeState::Follower,
                         VoteResult::OtherLeaderAppendRequest(req, tx) => {
                             self.state = NodeState::Follower;
-                            tx.send(self.handle_append_entries(req));
+                            let _ = tx.send(self.handle_append_entries(req));
                         }
                     }
                 }
@@ -474,17 +470,17 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                         }
                         command = self.event_receiver.recv() => {
                           match command.unwrap() {
-                            RaftCommand::SubmitEntry { request, tx } => {
-                                tx.send(Err(AppendError::NotLeader));
+                            RaftCommand::SubmitEntry { tx, .. } => {
+                                let _ = tx.send(Err(AppendError::NotLeader));
                             },
                             RaftCommand::AppendEntries { request, tx } => {
                                 let response = self.handle_append_entries(request);
-                                tx.send(response);
+                                let _ = tx.send(response);
 
                             },
                             RaftCommand::RequestVote { request, tx } => {
                                 let response = self.handle_request_vote(request);
-                                tx.send(response);
+                                let _ = tx.send(response);
                             }
                         }
                       }
@@ -494,19 +490,24 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
         }
     }
     fn handle_request_vote(&mut self, req: RequestVoteRequest) -> RequestVoteResponse {
-        if req.term < self.term {
-            eprintln!(
-                "Raft Instance {:?} refusing vote for {:?}",
-                self.id, req.candidate_id
-            );
-            return RequestVoteResponse {
-                term: self.term,
-                vote_granted: false,
-            };
-        } else if req.term > self.term {
-            self.term = req.term;
-            self.voted_for = None;
+        match req.term {
+            x if x < self.term => {
+                eprintln!(
+                    "Raft Instance {:?} refusing vote for {:?}",
+                    self.id, req.candidate_id
+                );
+                return RequestVoteResponse {
+                    term: self.term,
+                    vote_granted: false,
+                };
+            }
+            x if x > self.term => {
+                self.term = req.term;
+                self.voted_for = None;
+            }
+            _ => {}
         }
+
         if self.voted_for == Some(req.candidate_id) {
             return RequestVoteResponse {
                 term: self.term,
@@ -549,12 +550,12 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
 pub mod test {
     use std::{collections::HashMap, time::Duration};
 
-    use tokio::sync::mpsc::{channel, Receiver, Sender};
+    use tokio::sync::mpsc::{channel, Sender};
     use tokio::sync::oneshot;
 
     use crate::{
-        AppendEntriesRequest, AppendEntriesResponse, Peer, PeerId, PeerUrl, Raft, RaftCommand,
-        RequestVoteRequest, RequestVoteResponse, Transport,
+        AppendEntriesRequest, AppendEntriesResponse, Peer, PeerId, Raft, RaftCommand,
+        RequestVoteRequest, RequestVoteResponse, Topology, Transport,
     };
     struct Message<M, R> {
         peer_id: PeerId,
@@ -575,11 +576,12 @@ pub mod test {
             let (tx, rx) = oneshot::channel();
             self.ae_channel
                 .send(Message {
-                    peer_id: peer_id,
+                    peer_id,
                     message: msg,
                     tx,
                 })
-                .await;
+                .await
+                .unwrap();
             rx.await.unwrap()
         }
 
@@ -591,17 +593,18 @@ pub mod test {
             let (tx, rx) = oneshot::channel();
             self.rv_channel
                 .send(Message {
-                    peer_id: peer_id,
+                    peer_id,
                     message: msg,
                     tx,
                 })
-                .await;
+                .await
+                .unwrap();
             rx.await.unwrap()
         }
     }
 
     struct RaftNode {
-        id: PeerId,
+        _id: PeerId,
         event_emitter: Sender<RaftCommand<String>>,
     }
 
@@ -613,22 +616,22 @@ pub mod test {
         let mut comms_channels = vec![];
         for i in 0..3 {
             let (tx1, rx1) = channel(100);
-            let (tx4, rx4) = channel(100);
+            let (tx4, _) = channel(100);
             comms_channels.push(tx1.clone());
             let transport = LocalTransport {
                 ae_channel: tx2.clone(),
                 rv_channel: tx3.clone(),
             };
             let raft_node = RaftNode {
-                id: PeerId(i),
+                _id: PeerId(i),
                 event_emitter: tx1,
             };
             nodes.insert(i, raft_node);
-            let mut raft = Raft::<_, String>::new(transport, rx1, tx4);
-            raft.install_config(crate::Topology {
+            let topology = Topology {
                 node_id: PeerId(i),
                 peers: (0..3).map(|i| Peer::new(PeerId(i))).collect(),
-            });
+            };
+            let raft = Raft::<_, String>::new(transport, topology, rx1, tx4);
             tokio::spawn(raft.run());
         }
         let fut = tokio::time::sleep(Duration::from_millis(5000));
@@ -637,12 +640,13 @@ pub mod test {
             tokio::time::sleep(Duration::from_millis(500)).await;
             for i in 0..40 {
                 for item in &mut comms_channels {
-                    let (tx, rx) = oneshot::channel();
-                    item.send(RaftCommand::SubmitEntry {
-                        request: format!("Iteration number {}", i),
-                        tx,
-                    })
-                    .await;
+                    let (tx, _) = oneshot::channel();
+                    let _ = item
+                        .send(RaftCommand::SubmitEntry {
+                            request: format!("Iteration number {}", i),
+                            tx,
+                        })
+                        .await;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
