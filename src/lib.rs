@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::{thread_rng, Rng};
 use tokio::{
@@ -12,14 +14,19 @@ const ELECTION_TIMEOUT_MIN: u64 = 150;
 const ELECTION_TIMEOUT_MAX: u64 = 300;
 
 pub trait Transport<LogCommand> {
+    type Error: Debug;
     #[allow(async_fn_in_trait)]
     async fn append_entries(
         &self,
         peer_id: PeerId,
         msg: AppendEntriesRequest<LogCommand>,
-    ) -> AppendEntriesResponse;
+    ) -> Result<AppendEntriesResponse, Self::Error>;
     #[allow(async_fn_in_trait)]
-    async fn request_votes(&self, peer_id: PeerId, msg: RequestVoteRequest) -> RequestVoteResponse;
+    async fn request_votes(
+        &self,
+        peer_id: PeerId,
+        msg: RequestVoteRequest,
+    ) -> Result<RequestVoteResponse, Self::Error>;
 }
 
 pub struct Topology {
@@ -115,7 +122,7 @@ pub enum RaftCommand<LogCommand> {
     },
 }
 
-pub struct Raft<T, LogCommand> {
+pub struct Raft<T, LogCommand: Debug> {
     id: PeerId,
     term: Term,
     commit_index: Option<usize>,
@@ -127,13 +134,14 @@ pub struct Raft<T, LogCommand> {
     log: Vec<LogEntry<LogCommand>>,
     event_receiver: mpsc::Receiver<RaftCommand<LogCommand>>,
     commit_channel: mpsc::Sender<LogCommand>,
+    current_leader: Option<PeerId>,
 }
 
 pub enum AppendError {
-    NotLeader,
+    NotLeader(Option<PeerId>),
 }
 
-impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
+impl<T: Transport<LogCommand>, LogCommand: Debug + Clone + Send> Raft<T, LogCommand> {
     pub fn new(
         transport: T,
         topology: Topology,
@@ -158,6 +166,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
             log: vec![],
             event_receiver: rx,
             commit_channel: tx,
+            current_leader: None,
         }
     }
     fn is_leader(&self) -> bool {
@@ -165,10 +174,15 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
     }
     fn submit_entry(&mut self, command: LogCommand) -> Result<(), AppendError> {
         if self.is_leader() {
+            eprintln!(
+                "Raft Instance {:?} submitting to log at index {}",
+                self.id,
+                self.log.len()
+            );
             self.log.push(LogEntry::new(self.term, command));
             Ok(())
         } else {
-            Err(AppendError::NotLeader)
+            Err(AppendError::NotLeader(self.current_leader))
         }
     }
     fn handle_command(&mut self, command: RaftCommand<LogCommand>) {
@@ -194,11 +208,11 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
         }
     }
     fn update_commit_index(&mut self, new_commit_index: Option<usize>) {
-        println!(
-            "Raft Instance {:?} updating commit index {:?}",
-            self.id, new_commit_index
-        );
         if new_commit_index > self.commit_index {
+            println!(
+                "Raft Instance {:?} updating commit index {:?}",
+                self.id, new_commit_index
+            );
             let old_commit_index = self.commit_index;
             self.commit_index = new_commit_index;
             for item in &self.log
@@ -238,13 +252,21 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                     .transport
                     .append_entries(peer.id, append_entries_request)
                     .await;
-                (peer_id, entries_len, result)
+                result
+                    .map(|res| (peer_id, entries_len, res))
+                    .map_err(|e| (peer_id, e))
             });
         }
         let mut out = vec![];
 
         while let Some(result) = jhs.next().await {
-            out.push(result);
+            match result {
+                Ok(res) => out.push(res),
+                Err(e) => eprintln!(
+                    "Raft Instance {:?} failed to respond to append entries {:?}",
+                    e.0, e.1
+                ),
+            };
         }
 
         out
@@ -258,8 +280,11 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                 term: self.term,
                 success: false,
             };
+        } else {
+            self.current_leader = Some(req.leader_id);
+            self.term = req.term;
         }
-        eprintln!("Raft Instance {:?} appending logs", self.id);
+        let log_len = self.log.len();
         if let Some(prev_log_index) = req.prev_log_index {
             let prev_log_term = req.prev_log_term.unwrap();
             let prev_log = self.log.get(prev_log_index);
@@ -294,6 +319,9 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
         } else {
             self.update_commit_index(Some(req.leader_commit.unwrap().min(self.log.len() - 1)));
         }
+        if self.log.len() > log_len {
+            eprintln!("Raft Instance {:?} appending logs", self.id);
+        }
         AppendEntriesResponse {
             term: self.term,
             success: true,
@@ -315,6 +343,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                 }
             } else if result.term > self.term {
                 self.term = result.term;
+                self.current_leader = None;
                 self.state = NodeState::Follower;
                 return;
             } else {
@@ -361,17 +390,26 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
         let mut total_votes = 0;
 
         let timeout_duration = thread_rng().gen_range(700..1200);
-        let timeout = Duration::from_millis(timeout_duration);
-        let timeout_fut = sleep(timeout);
-        tokio::pin!(timeout_fut);
+        let timeout = sleep(Duration::from_millis(timeout_duration));
+        tokio::pin!(timeout);
         loop {
             tokio::select! {
-                  _ = &mut timeout_fut => {
+                  _ = &mut timeout => {
                     eprintln!("Raft Instance {:?} vote timed out", candidate_id);
                     return VoteResult::TimedOut;
                   }
                   res = jhs.next() => {
                     if let Some(res) = res {
+                        let res = match res {
+                            Ok(res) => res,
+                            Err(e) => {
+                                eprintln!(
+                                    "Raft Instance failed to respond to append entries {:?}",
+                                    e
+                                );
+                                continue;
+                            }
+                        };
                       if res.vote_granted {
                         total_votes += 1;
                         if total_votes >= needs_votes {
@@ -380,7 +418,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                             return VoteResult::Winner;
                         }
                       } else if res.term > self.term {
-                            self.term = res.term;
+                          self.term = res.term;
                           return VoteResult::BiggerTerm(res.term);
                       }
                     } else {
@@ -390,7 +428,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                   command = self.event_receiver.recv() => {
                     match command.unwrap() {
                         RaftCommand::SubmitEntry { tx, .. } => {
-                            let _ = tx.send(Err(AppendError::NotLeader));
+                            let _ = tx.send(Err(AppendError::NotLeader(self.current_leader)));
                         },
                         RaftCommand::AppendEntries { request, tx } => {
                             if request.term >= self.term {
@@ -438,8 +476,12 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                     }
                 }
                 NodeState::Candidate => {
-                    eprintln!("Raft Instance {:?} initiating vote", self.id);
                     self.term.0 += 1;
+                    eprintln!(
+                        "Raft Instance {:?} initiating vote term {:?}",
+                        self.id, self.term
+                    );
+                    self.current_leader = None;
                     self.voted_for = Some(self.id);
                     let vote_result = self.get_votes().await;
                     match vote_result {
@@ -464,27 +506,32 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                     let timeout_duration =
                         thread_rng().gen_range(ELECTION_TIMEOUT_MIN..ELECTION_TIMEOUT_MAX);
                     let timeout = Duration::from_millis(timeout_duration);
+                    let timeout = sleep(timeout);
                     tokio::select! {
-                        _ = sleep(timeout) => {
+                        _ = timeout => {
                             self.state = NodeState::Candidate
                         }
-                        command = self.event_receiver.recv() => {
-                          match command.unwrap() {
-                            RaftCommand::SubmitEntry { tx, .. } => {
-                                let _ = tx.send(Err(AppendError::NotLeader));
-                            },
-                            RaftCommand::AppendEntries { request, tx } => {
-                                let response = self.handle_append_entries(request);
-                                let _ = tx.send(response);
-
-                            },
-                            RaftCommand::RequestVote { request, tx } => {
-                                let response = self.handle_request_vote(request);
-                                let _ = tx.send(response);
-                            }
-                        }
-                      }
+                        _ = self.await_heartbeat() => {}
                     }
+                }
+            }
+        }
+    }
+    async fn await_heartbeat(&mut self) {
+        loop {
+            let command = self.event_receiver.recv().await.unwrap();
+            match command {
+                RaftCommand::SubmitEntry { tx, .. } => {
+                    let _ = tx.send(Err(AppendError::NotLeader(self.current_leader)));
+                }
+                RaftCommand::AppendEntries { request, tx } => {
+                    let response = self.handle_append_entries(request);
+                    let _ = tx.send(response);
+                    return;
+                }
+                RaftCommand::RequestVote { request, tx } => {
+                    let response = self.handle_request_vote(request);
+                    let _ = tx.send(response);
                 }
             }
         }
@@ -502,6 +549,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                 };
             }
             x if x > self.term => {
+                self.current_leader = None;
                 self.term = req.term;
                 self.voted_for = None;
             }
@@ -529,6 +577,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                 "Raft Instance {:?} voting for {:?}",
                 self.id, req.candidate_id
             );
+            self.voted_for = Some(req.candidate_id);
             RequestVoteResponse {
                 term: self.term,
                 vote_granted: true,
@@ -546,10 +595,24 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
     }
 }
 
+impl<T, LogCommand: Debug> Drop for Raft<T, LogCommand> {
+    fn drop(&mut self) {
+        eprintln!(
+            "RAFT INSTANCE {:?} DROPPING LOG {} {:?}",
+            self.id,
+            self.log.len(),
+            self.log
+        );
+    }
+}
+
 #[cfg(test)]
 pub mod test {
+    use std::sync::{Arc, Mutex, RwLock};
+    use std::thread;
     use std::{collections::HashMap, time::Duration};
 
+    use rand::{thread_rng, Rng};
     use tokio::sync::mpsc::{channel, Sender};
     use tokio::sync::oneshot;
 
@@ -568,11 +631,12 @@ pub mod test {
     }
 
     impl Transport<String> for LocalTransport {
+        type Error = String;
         async fn append_entries(
             &self,
             peer_id: crate::PeerId,
             msg: AppendEntriesRequest<String>,
-        ) -> AppendEntriesResponse {
+        ) -> Result<AppendEntriesResponse, Self::Error> {
             let (tx, rx) = oneshot::channel();
             self.ae_channel
                 .send(Message {
@@ -582,14 +646,17 @@ pub mod test {
                 })
                 .await
                 .unwrap();
-            rx.await.unwrap()
+            rx.await.map_err(|e| {
+                eprintln!("Err receiving response {:?}", e);
+                String::from("Failed to recv response")
+            })
         }
 
         async fn request_votes(
             &self,
             peer_id: crate::PeerId,
             msg: RequestVoteRequest,
-        ) -> RequestVoteResponse {
+        ) -> Result<RequestVoteResponse, Self::Error> {
             let (tx, rx) = oneshot::channel();
             self.rv_channel
                 .send(Message {
@@ -599,7 +666,10 @@ pub mod test {
                 })
                 .await
                 .unwrap();
-            rx.await.unwrap()
+            rx.await.map_err(|e| {
+                eprintln!("Err receiving response {:?}", e);
+                String::from("Failed to recv response")
+            })
         }
     }
 
@@ -634,11 +704,12 @@ pub mod test {
             let raft = Raft::<_, String>::new(transport, topology, rx1, tx4);
             tokio::spawn(raft.run());
         }
-        let fut = tokio::time::sleep(Duration::from_millis(5000));
+        let fut = tokio::time::sleep(Duration::from_millis(30000));
         tokio::pin!(fut);
+        let blocked = Arc::new(RwLock::new(PeerId(1234)));
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            for i in 0..40 {
+            for i in 0..3000 {
                 for item in &mut comms_channels {
                     let (tx, _) = oneshot::channel();
                     let _ = item
@@ -648,14 +719,25 @@ pub mod test {
                         })
                         .await;
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
+        });
+        let blocked_clone = blocked.clone();
+        // TODO: Test with 5 nodes
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(1000));
+            let mut blocked = blocked_clone.write().unwrap();
+            *blocked = PeerId(thread_rng().gen_range(0..3));
+            eprintln!("BLOCKING PEER {:?}", *blocked);
         });
         loop {
             tokio::select! {
               _ = &mut fut => break,
               msg = rx2.recv() => {
                 let msg = msg.unwrap();
+                if msg.peer_id == *blocked.read().unwrap() {
+                    continue;
+                }
                 let found_node = nodes.get(&msg.peer_id.0).unwrap();
                 found_node
                     .event_emitter
@@ -668,6 +750,9 @@ pub mod test {
               }
               msg = rx3.recv() => {
                 let msg = msg.unwrap();
+                if msg.peer_id == *blocked.read().unwrap() {
+                    continue;
+                }
                 let found_node = nodes.get(&msg.peer_id.0).unwrap();
                 found_node
                     .event_emitter
