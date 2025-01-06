@@ -1,5 +1,3 @@
-use std::fmt::Debug;
-
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::{thread_rng, Rng};
 use tokio::{
@@ -14,7 +12,7 @@ const ELECTION_TIMEOUT_MIN: u64 = 150;
 const ELECTION_TIMEOUT_MAX: u64 = 300;
 
 pub trait Transport<LogCommand> {
-    type Error: Debug;
+    type Error: std::error::Error;
     #[allow(async_fn_in_trait)]
     async fn append_entries(
         &self,
@@ -122,11 +120,11 @@ pub enum RaftCommand<LogCommand> {
     },
 }
 
-pub struct Raft<T, LogCommand: Debug> {
+pub struct Raft<T, LogCommand> {
     id: PeerId,
     term: Term,
     commit_index: Option<usize>,
-    last_applied: Option<usize>,
+    // last_applied: Option<usize>,
     state: NodeState,
     peers: Vec<Peer>,
     transport: T,
@@ -141,7 +139,7 @@ pub enum AppendError {
     NotLeader(Option<PeerId>),
 }
 
-impl<T: Transport<LogCommand>, LogCommand: Debug + Clone + Send> Raft<T, LogCommand> {
+impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
     pub fn new(
         transport: T,
         topology: Topology,
@@ -158,7 +156,7 @@ impl<T: Transport<LogCommand>, LogCommand: Debug + Clone + Send> Raft<T, LogComm
             id,
             term: Term(0),
             commit_index: None,
-            last_applied: None,
+            // last_applied: None,
             state: NodeState::Follower,
             peers,
             transport,
@@ -263,7 +261,7 @@ impl<T: Transport<LogCommand>, LogCommand: Debug + Clone + Send> Raft<T, LogComm
             match result {
                 Ok(res) => out.push(res),
                 Err(e) => eprintln!(
-                    "Raft Instance {:?} failed to respond to append entries {:?}",
+                    "Raft Instance {:?} failed to respond to append entries {}",
                     e.0, e.1
                 ),
             };
@@ -595,24 +593,14 @@ impl<T: Transport<LogCommand>, LogCommand: Debug + Clone + Send> Raft<T, LogComm
     }
 }
 
-impl<T, LogCommand: Debug> Drop for Raft<T, LogCommand> {
-    fn drop(&mut self) {
-        eprintln!(
-            "RAFT INSTANCE {:?} DROPPING LOG {} {:?}",
-            self.id,
-            self.log.len(),
-            self.log
-        );
-    }
-}
-
 #[cfg(test)]
 pub mod test {
-    use std::sync::{Arc, Mutex, RwLock};
+    use std::sync::{Arc, RwLock};
     use std::thread;
     use std::{collections::HashMap, time::Duration};
 
     use rand::{thread_rng, Rng};
+    use tokio::sync::mpsc::error::SendError;
     use tokio::sync::mpsc::{channel, Sender};
     use tokio::sync::oneshot;
 
@@ -631,7 +619,7 @@ pub mod test {
     }
 
     impl Transport<String> for LocalTransport {
-        type Error = String;
+        type Error = SendError<String>;
         async fn append_entries(
             &self,
             peer_id: crate::PeerId,
@@ -648,7 +636,7 @@ pub mod test {
                 .unwrap();
             rx.await.map_err(|e| {
                 eprintln!("Err receiving response {:?}", e);
-                String::from("Failed to recv response")
+                SendError(e.to_string())
             })
         }
 
@@ -668,7 +656,7 @@ pub mod test {
                 .unwrap();
             rx.await.map_err(|e| {
                 eprintln!("Err receiving response {:?}", e);
-                String::from("Failed to recv response")
+                SendError(e.to_string())
             })
         }
     }
