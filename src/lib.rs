@@ -1,6 +1,11 @@
+use std::{error::Error, marker::PhantomData, path::PathBuf};
+
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::{thread_rng, Rng};
+use serde::{Deserialize, Serialize};
 use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     sync::{
         mpsc::{self},
         oneshot,
@@ -10,6 +15,74 @@ use tokio::{
 
 const ELECTION_TIMEOUT_MIN: u64 = 150;
 const ELECTION_TIMEOUT_MAX: u64 = 300;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PersistedData<LogCommand> {
+    term: Term,
+    voted_for: Option<PeerId>,
+    pub log: Vec<LogEntry<LogCommand>>,
+}
+
+impl<LogCommand> Default for PersistedData<LogCommand> {
+    fn default() -> Self {
+        Self {
+            term: Term(0),
+            voted_for: None,
+            log: vec![],
+        }
+    }
+}
+
+pub trait Persist<LogCommand> {
+    async fn save(&self, data: PersistedData<LogCommand>) -> Result<(), Box<dyn Error>>;
+    async fn load(&self) -> Result<Option<PersistedData<LogCommand>>, Box<dyn Error>>;
+}
+
+pub struct DiskPersist<LogCommand> {
+    path: PathBuf,
+    _boo: PhantomData<LogCommand>,
+}
+
+impl<LogCommand> Persist<LogCommand> for DiskPersist<LogCommand>
+where
+    LogCommand: for<'de> Deserialize<'de> + Serialize,
+{
+    async fn save(&self, data: PersistedData<LogCommand>) -> Result<(), Box<dyn Error>> {
+        let fp = File::create(&self.path).await?;
+        let mut writer = BufWriter::new(fp);
+        let serialized = bincode::serialize(&data)?;
+        writer.write_all(&serialized[..]).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    async fn load(&self) -> Result<Option<PersistedData<LogCommand>>, Box<dyn Error>> {
+        let fp = match File::open(&self.path).await {
+            Ok(fp) => fp,
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::NotFound => return Ok(None),
+                _ => {
+                    return Err(e)?;
+                }
+            },
+        };
+
+        let mut reader = BufReader::new(fp);
+        let mut buf = vec![];
+        reader.read_to_end(&mut buf).await?;
+        let out = bincode::deserialize(&buf[..])?;
+        Ok(Some(out))
+    }
+}
+
+impl<LogCommand> DiskPersist<LogCommand> {
+    pub fn new<T: Into<PathBuf>>(path: T) -> Self {
+        Self {
+            path: path.into(),
+            _boo: PhantomData,
+        }
+    }
+}
 
 pub trait Transport<LogCommand> {
     type Error: std::error::Error;
@@ -56,9 +129,9 @@ pub struct RequestVoteResponse {
     vote_granted: bool,
 }
 
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Copy)]
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Copy, Serialize, Deserialize)]
 struct Term(u64);
-#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerId(u64);
 
 enum VoteResult<LogCommand> {
@@ -93,10 +166,10 @@ enum NodeState {
     Candidate,
     Follower,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry<LogCommand> {
     term: Term,
-    command: LogCommand,
+    pub command: LogCommand,
 }
 
 impl<LogCommand> LogEntry<LogCommand> {
@@ -120,7 +193,7 @@ pub enum RaftCommand<LogCommand> {
     },
 }
 
-pub struct Raft<T, LogCommand> {
+pub struct Raft<T, LogCommand, P> {
     id: PeerId,
     term: Term,
     commit_index: Option<usize>,
@@ -133,15 +206,21 @@ pub struct Raft<T, LogCommand> {
     event_receiver: mpsc::Receiver<RaftCommand<LogCommand>>,
     commit_channel: mpsc::Sender<LogCommand>,
     current_leader: Option<PeerId>,
+    persist: P,
 }
 
 pub enum AppendError {
     NotLeader(Option<PeerId>),
 }
 
-impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
-    pub fn new(
+impl<T: Transport<LogCommand>, LogCommand: Clone + Send + Serialize, P: Persist<LogCommand>>
+    Raft<T, LogCommand, P>
+where
+    LogCommand: for<'de> Deserialize<'de>,
+{
+    pub async fn new(
         transport: T,
+        persist: P,
         topology: Topology,
         rx: mpsc::Receiver<RaftCommand<LogCommand>>,
         tx: mpsc::Sender<LogCommand>,
@@ -152,19 +231,36 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
             .into_iter()
             .filter(|node| node.id != id)
             .collect();
+        let PersistedData {
+            term,
+            voted_for,
+            log,
+        } = persist.load().await.unwrap().unwrap_or_default();
         Self {
             id,
-            term: Term(0),
+            term,
             commit_index: None,
             // last_applied: None,
             state: NodeState::Follower,
             peers,
             transport,
-            voted_for: None,
-            log: vec![],
+            voted_for,
+            log,
             event_receiver: rx,
             commit_channel: tx,
             current_leader: None,
+            persist,
+        }
+    }
+    async fn persist_state(&self) {
+        let state = PersistedData {
+            term: self.term,
+            voted_for: self.voted_for,
+            log: self.log.clone(),
+        };
+        if let Err(e) = self.persist.save(state).await {
+            eprintln!("{}", e);
+            panic!("Something went wrong");
         }
     }
     fn is_leader(&self) -> bool {
@@ -183,10 +279,10 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
             Err(AppendError::NotLeader(self.current_leader))
         }
     }
-    fn handle_command(&mut self, command: RaftCommand<LogCommand>) {
+    async fn handle_command(&mut self, command: RaftCommand<LogCommand>) {
         match command {
             RaftCommand::AppendEntries { request, tx } => {
-                let response = self.handle_append_entries(request);
+                let response = self.handle_append_entries(request).await;
                 if response.success {
                     self.state = NodeState::Follower;
                 }
@@ -194,6 +290,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
             }
             RaftCommand::RequestVote { request, tx } => {
                 let response = self.handle_request_vote(request);
+                self.persist_state().await;
                 if response.vote_granted {
                     self.state = NodeState::Follower;
                 }
@@ -201,6 +298,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
             }
             RaftCommand::SubmitEntry { request, tx } => {
                 let result = self.submit_entry(request);
+                self.persist_state().await;
                 let _ = tx.send(result);
             }
         }
@@ -269,7 +367,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
 
         out
     }
-    fn handle_append_entries(
+    async fn handle_append_entries(
         &mut self,
         req: AppendEntriesRequest<LogCommand>,
     ) -> AppendEntriesResponse {
@@ -287,6 +385,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
             let prev_log_term = req.prev_log_term.unwrap();
             let prev_log = self.log.get(prev_log_index);
             if prev_log.is_none() || prev_log.unwrap().term != prev_log_term {
+                self.persist_state().await;
                 return AppendEntriesResponse {
                     term: self.term,
                     success: false,
@@ -320,6 +419,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
         if self.log.len() > log_len {
             eprintln!("Raft Instance {:?} appending logs", self.id);
         }
+        self.persist_state().await;
         AppendEntriesResponse {
             term: self.term,
             success: true,
@@ -469,12 +569,13 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                     tokio::select! {
                             _ = sleep(timeout) => {},
                             msg = self.event_receiver.recv() => {
-                              self.handle_command(msg.unwrap());
-                          }
+                                self.handle_command(msg.unwrap()).await;
+                            }
                     }
                 }
                 NodeState::Candidate => {
                     self.term.0 += 1;
+                    self.persist_state().await;
                     eprintln!(
                         "Raft Instance {:?} initiating vote term {:?}",
                         self.id, self.term
@@ -488,6 +589,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                         }
                         VoteResult::BiggerTerm(term) => {
                             self.term = term;
+                            self.persist_state().await;
                             self.state = NodeState::Follower;
                         }
                         VoteResult::TimedOut => {
@@ -496,7 +598,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                         VoteResult::Loser => self.state = NodeState::Follower,
                         VoteResult::OtherLeaderAppendRequest(req, tx) => {
                             self.state = NodeState::Follower;
-                            let _ = tx.send(self.handle_append_entries(req));
+                            let _ = tx.send(self.handle_append_entries(req).await);
                         }
                     }
                 }
@@ -523,12 +625,13 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
                     let _ = tx.send(Err(AppendError::NotLeader(self.current_leader)));
                 }
                 RaftCommand::AppendEntries { request, tx } => {
-                    let response = self.handle_append_entries(request);
+                    let response = self.handle_append_entries(request).await;
                     let _ = tx.send(response);
                     return;
                 }
                 RaftCommand::RequestVote { request, tx } => {
                     let response = self.handle_request_vote(request);
+                    self.persist_state().await;
                     let _ = tx.send(response);
                 }
             }
@@ -595,6 +698,7 @@ impl<T: Transport<LogCommand>, LogCommand: Clone + Send> Raft<T, LogCommand> {
 
 #[cfg(test)]
 pub mod test {
+    use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
     use std::thread;
     use std::{collections::HashMap, time::Duration};
@@ -605,7 +709,7 @@ pub mod test {
     use tokio::sync::oneshot;
 
     use crate::{
-        AppendEntriesRequest, AppendEntriesResponse, Peer, PeerId, Raft, RaftCommand,
+        AppendEntriesRequest, AppendEntriesResponse, DiskPersist, Peer, PeerId, Raft, RaftCommand,
         RequestVoteRequest, RequestVoteResponse, Topology, Transport,
     };
     struct Message<M, R> {
@@ -689,7 +793,8 @@ pub mod test {
                 node_id: PeerId(i),
                 peers: (0..3).map(|i| Peer::new(PeerId(i))).collect(),
             };
-            let raft = Raft::<_, String>::new(transport, topology, rx1, tx4);
+            let persist = DiskPersist::new(PathBuf::from(format!("saved/{}", i)));
+            let raft = Raft::<_, String, _>::new(transport, persist, topology, rx1, tx4).await;
             tokio::spawn(raft.run());
         }
         let fut = tokio::time::sleep(Duration::from_millis(30000));
@@ -697,7 +802,7 @@ pub mod test {
         let blocked = Arc::new(RwLock::new(PeerId(1234)));
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            for i in 0..3000 {
+            for i in 0..1000 {
                 for item in &mut comms_channels {
                     let (tx, _) = oneshot::channel();
                     let _ = item
@@ -713,7 +818,7 @@ pub mod test {
         let blocked_clone = blocked.clone();
         // TODO: Test with 5 nodes
         thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(1000));
+            thread::sleep(Duration::from_millis(100));
             let mut blocked = blocked_clone.write().unwrap();
             *blocked = PeerId(thread_rng().gen_range(0..3));
             eprintln!("BLOCKING PEER {:?}", *blocked);
