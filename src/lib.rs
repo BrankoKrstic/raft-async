@@ -1,3 +1,5 @@
+#![allow(async_fn_in_trait)]
+
 use std::{error::Error, marker::PhantomData, path::PathBuf};
 
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -800,60 +802,76 @@ pub mod test {
         let fut = tokio::time::sleep(Duration::from_millis(30000));
         tokio::pin!(fut);
         let blocked = Arc::new(RwLock::new(PeerId(1234)));
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            for i in 0..1000 {
-                for item in &mut comms_channels {
+        let blocked_clone = blocked.clone();
+        let blocked_clone_2 = blocked.clone();
+
+        thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(500));
+            for i in 0..3000 {
+                let peer = blocked_clone_2.read().unwrap();
+                for (id, item) in comms_channels.iter_mut().enumerate() {
                     let (tx, _) = oneshot::channel();
-                    let _ = item
-                        .send(RaftCommand::SubmitEntry {
+                    if peer.0 == id as u64 {
+                        let _ = item.try_send(RaftCommand::SubmitEntry {
+                            request: format!("Iteration number {} blocked", i),
+                            tx,
+                        });
+                    } else {
+                        let _ = item.try_send(RaftCommand::SubmitEntry {
                             request: format!("Iteration number {}", i),
                             tx,
-                        })
-                        .await;
+                        });
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                drop(peer);
+                thread::sleep(std::time::Duration::from_millis(10));
             }
         });
-        let blocked_clone = blocked.clone();
         // TODO: Test with 5 nodes
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(100));
-            let mut blocked = blocked_clone.write().unwrap();
-            *blocked = PeerId(thread_rng().gen_range(0..3));
-            eprintln!("BLOCKING PEER {:?}", *blocked);
+        thread::spawn(move || {
+            let mut peer = 0;
+            loop {
+                thread::sleep(Duration::from_millis(1000));
+                let mut blocked = blocked_clone.write().unwrap();
+                *blocked = PeerId(peer);
+                eprintln!("BLOCKING PEER {:?}", *blocked);
+                peer = (peer + 1) % 3;
+            }
         });
         loop {
             tokio::select! {
               _ = &mut fut => break,
               msg = rx2.recv() => {
                 let msg = msg.unwrap();
-                if msg.peer_id == *blocked.read().unwrap() {
+                let blocked = blocked.read().unwrap();
+                let sender = msg.message.leader_id;
+                if msg.peer_id == *blocked || sender == *blocked {
                     continue;
                 }
                 let found_node = nodes.get(&msg.peer_id.0).unwrap();
                 found_node
                     .event_emitter
-                    .send(RaftCommand::AppendEntries {
+                    .try_send(RaftCommand::AppendEntries {
                         request: msg.message,
                         tx: msg.tx,
                     })
-                    .await
                     .unwrap();
               }
               msg = rx3.recv() => {
                 let msg = msg.unwrap();
-                if msg.peer_id == *blocked.read().unwrap() {
+                let sender = msg.message.candidate_id;
+                let blocked = blocked.read().unwrap();
+
+                if msg.peer_id == *blocked  || sender == *blocked  {
                     continue;
                 }
                 let found_node = nodes.get(&msg.peer_id.0).unwrap();
                 found_node
                     .event_emitter
-                    .send(RaftCommand::RequestVote {
+                    .try_send(RaftCommand::RequestVote {
                         request: msg.message,
                         tx: msg.tx,
                     })
-                    .await
                     .unwrap();
               }
             }
