@@ -705,7 +705,6 @@ pub mod test {
     use std::thread;
     use std::{collections::HashMap, time::Duration};
 
-    use rand::{thread_rng, Rng};
     use tokio::sync::mpsc::error::SendError;
     use tokio::sync::mpsc::{channel, Sender};
     use tokio::sync::oneshot;
