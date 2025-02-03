@@ -445,6 +445,7 @@ where
                 self.term = result.term;
                 self.current_leader = None;
                 self.state = NodeState::Follower;
+                self.persist_state().await;
                 return;
             } else {
                 let peer = self.peers.iter_mut().find(|p| p.id == peer_id);
