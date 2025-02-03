@@ -444,6 +444,7 @@ where
             } else if result.term > self.term {
                 self.term = result.term;
                 self.current_leader = None;
+                self.voted_for = None;
                 self.state = NodeState::Follower;
                 self.persist_state().await;
                 return;
